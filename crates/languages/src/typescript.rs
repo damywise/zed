@@ -896,6 +896,7 @@ impl LspAdapter for EsLintLspAdapter {
 
         Ok(Box::new(GitHubLspBinaryVersion {
             name: Self::CURRENT_VERSION.into(),
+            digest: None,
             url,
         }))
     }
