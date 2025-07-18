@@ -1,0 +1,570 @@
+name: Windows Build & Test
+
+on:
+  push:
+    branches:
+      - main
+      - "v[0-9]+.[0-9]+.x"
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - "**"
+    paths:
+      - '**.rs'
+      - '**.toml'
+      - 'crates/**'
+      - 'assets/**'
+      - 'script/**'
+      - '.cargo/**'
+      - '.github/workflows/windows-build.yml'
+      - '.github/actions/**'
+
+  workflow_dispatch:
+    inputs:
+      create_bundle:
+        description: 'Create Windows installer bundle'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'main' && github.sha || 'anysha' }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+
+jobs:
+  detect_changes:
+    name: Detect changes
+    runs-on: windows-latest
+    outputs:
+      should_run: ${{ steps.changes.outputs.should_run }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for relevant changes
+        id: changes
+        shell: bash
+        run: |
+          # Force run on workflow_dispatch or tag pushes
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          # Check for changes in relevant files
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            head_sha="${{ github.event.pull_request.head.sha }}"
+          else
+            base_sha="${{ github.event.before }}"
+            head_sha="${{ github.sha }}"
+          fi
+          
+          # Files that should trigger Windows builds
+          relevant_files=$(git diff --name-only ${base_sha}..${head_sha} | grep -E '\.(rs|toml)$|^crates/|^assets/|^script/|^\.cargo/|^\.github/workflows/windows-build\.yml$|^\.github/actions/' || true)
+          
+          if [[ -n "$relevant_files" ]]; then
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            echo "Detected changes in: $relevant_files"
+          else
+            echo "should_run=false" >> $GITHUB_OUTPUT
+            echo "No relevant changes detected"
+          fi
+
+  setup-windows-environment:
+    name: Setup Windows Build Environment
+    runs-on: windows-latest
+    needs: detect_changes
+    if: needs.detect_changes.outputs.should_run == 'true'
+    outputs:
+      rust-version: ${{ steps.rust.outputs.version }}
+      cmake-path: ${{ steps.deps.outputs.cmake-path }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Enable long path support
+        shell: powershell
+        run: |
+          # Enable long path support for Windows and Git
+          git config --global core.longpaths true
+          try {
+            New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem" -Name "LongPathsEnabled" -Value 1 -PropertyType DWORD -Force -ErrorAction SilentlyContinue
+          } catch {
+            Write-Host "Note: Could not set LongPathsEnabled registry key (requires admin privileges)"
+          }
+
+      - name: Install Rust toolchain
+        shell: powershell
+        run: |
+          # Install rustup if not present
+          if (!(Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing Rust..."
+            Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile "rustup-init.exe"
+            .\rustup-init.exe -y --default-toolchain none
+            Remove-Item "rustup-init.exe"
+            # Add to PATH for this session
+            $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          }
+          
+          # Install the required toolchain from rust-toolchain.toml
+          rustup show
+
+      - name: Get Rust version
+        id: rust
+        shell: bash
+        run: |
+          version=$(rustc --version | cut -d' ' -f2)
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Install Windows dependencies
+        id: deps
+        shell: powershell
+        run: |
+          # Check for Visual Studio Build Tools or Visual Studio
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          
+          if (Test-Path $vsWhere) {
+            $installations = & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json | ConvertFrom-Json
+            if ($installations.Count -eq 0) {
+              Write-Error "Visual Studio with C++ build tools not found. Please install Visual Studio 2019/2022 with C++ workload or Visual Studio Build Tools."
+              exit 1
+            }
+            Write-Host "Found Visual Studio installation: $($installations[0].displayName)"
+          } else {
+            Write-Host "vswhere.exe not found. Assuming Visual Studio is installed correctly."
+          }
+          
+          # Check for Windows SDK
+          $sdkPath = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+          if (Test-Path $sdkPath) {
+            $sdkVersions = Get-ChildItem $sdkPath -Directory | Where-Object { $_.Name -like "10.0.*" } | Sort-Object Name -Descending
+            if ($sdkVersions.Count -eq 0) {
+              Write-Error "Windows 10/11 SDK not found. Please install Windows SDK version 10.0.20348.0 or later."
+              exit 1
+            }
+            $latestSdk = $sdkVersions[0].Name
+            Write-Host "Found Windows SDK: $latestSdk"
+          }
+          
+          # Find CMake
+          $cmakePaths = @(
+            "${env:ProgramFiles}\CMake\bin\cmake.exe",
+            "${env:ProgramFiles(x86)}\CMake\bin\cmake.exe",
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Enterprise\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Professional\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2019\Enterprise\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2019\Professional\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe",
+            "${env:ProgramFiles(x86)}\Microsoft Visual Studio\2019\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+          )
+          
+          $cmakeFound = $false
+          foreach ($path in $cmakePaths) {
+            if (Test-Path $path) {
+              $cmakeDir = Split-Path $path -Parent
+              Write-Host "Found CMake at: $path"
+              Write-Output "cmake-path=$cmakeDir" >> $env:GITHUB_OUTPUT
+              $cmakeFound = $true
+              break
+            }
+          }
+          
+          if (-not $cmakeFound) {
+            # Try to find cmake in PATH
+            if (Get-Command cmake -ErrorAction SilentlyContinue) {
+              Write-Host "CMake found in PATH"
+              Write-Output "cmake-path=" >> $env:GITHUB_OUTPUT
+            } else {
+              Write-Error "CMake not found. Please install CMake or Visual Studio with C++ CMake tools."
+              exit 1
+            }
+          }
+
+      - name: Verify build environment
+        shell: powershell
+        run: |
+          Write-Host "=== Build Environment Verification ==="
+          
+          # Check Rust
+          Write-Host "Rust version:"
+          rustc --version
+          Write-Host "Cargo version:"
+          cargo --version
+          
+          # Check CMake
+          Write-Host "CMake version:"
+          cmake --version
+          
+          # Check Visual Studio
+          $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vsWhere) {
+            Write-Host "Visual Studio installations:"
+            & $vsWhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64
+          }
+          
+          Write-Host "=== Environment Variables ==="
+          Write-Host "PATH contains cargo: $($env:PATH -like '*cargo*')"
+          Write-Host "RUSTUP_HOME: $env:RUSTUP_HOME"
+          Write-Host "CARGO_HOME: $env:CARGO_HOME"
+
+  build:
+    name: Build Zed on Windows
+    runs-on: windows-latest
+    needs: [detect_changes, setup-windows-environment]
+    if: needs.detect_changes.outputs.should_run == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Setup Rust toolchain
+        shell: powershell
+        run: |
+          # Install rustup if not present
+          if (!(Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing Rust..."
+            Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile "rustup-init.exe"
+            .\rustup-init.exe -y --default-toolchain none
+            Remove-Item "rustup-init.exe"
+            $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          }
+          rustup show
+
+      - name: Add CMake to PATH
+        if: needs.setup-windows-environment.outputs.cmake-path != ''
+        shell: powershell
+        run: |
+          $cmakePath = "${{ needs.setup-windows-environment.outputs.cmake-path }}"
+          $env:PATH = "$cmakePath;$env:PATH"
+          Write-Output "PATH=$env:PATH" >> $env:GITHUB_ENV
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ needs.setup-windows-environment.outputs.rust-version }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-
+
+      - name: Configure CI build settings
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path ".\..\\.cargo" -Force
+          Copy-Item -Path ".\\.cargo\\ci-config.toml" -Destination ".\..\\.cargo\\config.toml"
+
+      - name: Build Zed (Debug)
+        shell: powershell
+        run: |
+          Write-Host "Building Zed in debug mode..."
+          cargo build --workspace
+
+      - name: Build Zed (Release)
+        shell: powershell
+        run: |
+          Write-Host "Building Zed in release mode..."
+          cargo build --release --package zed
+
+      - name: Clean CI config
+        if: always()
+        shell: powershell
+        run: |
+          Remove-Item -Recurse -Path ".\..\\.cargo" -Force -ErrorAction SilentlyContinue
+
+      - name: Upload Zed executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-windows-${{ github.sha }}
+          path: target/release/zed.exe
+          retention-days: 7
+
+  test:
+    name: Run Tests on Windows
+    runs-on: windows-latest
+    needs: [detect_changes, setup-windows-environment]
+    if: needs.detect_changes.outputs.should_run == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Setup Rust toolchain
+        shell: powershell
+        run: |
+          if (!(Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing Rust..."
+            Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile "rustup-init.exe"
+            .\rustup-init.exe -y --default-toolchain none
+            Remove-Item "rustup-init.exe"
+            $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          }
+          rustup show
+
+      - name: Add CMake to PATH
+        if: needs.setup-windows-environment.outputs.cmake-path != ''
+        shell: powershell
+        run: |
+          $cmakePath = "${{ needs.setup-windows-environment.outputs.cmake-path }}"
+          $env:PATH = "$cmakePath;$env:PATH"
+          Write-Output "PATH=$env:PATH" >> $env:GITHUB_ENV
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}-${{ needs.setup-windows-environment.outputs.rust-version }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}-
+            ${{ runner.os }}-cargo-test-
+            ${{ runner.os }}-cargo-
+
+      - name: Configure CI build settings
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Path ".\..\\.cargo" -Force
+          Copy-Item -Path ".\\.cargo\\ci-config.toml" -Destination ".\..\\.cargo\\config.toml"
+
+      - name: Install test dependencies
+        shell: powershell
+        run: |
+          # Install cargo-nextest for faster testing
+          cargo install cargo-nextest --locked
+          
+          # Install Node.js for tests that might need it
+          if (!(Get-Command node -ErrorAction SilentlyContinue)) {
+            Write-Host "Node.js will be installed by setup-node action"
+          }
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Run Clippy
+        shell: powershell
+        run: |
+          Write-Host "Running Clippy..."
+          .\script\clippy.ps1
+
+      - name: Run tests
+        shell: powershell
+        run: |
+          Write-Host "Running tests..."
+          cargo nextest run --workspace --no-fail-fast
+
+      - name: Clean CI config
+        if: always()
+        shell: powershell
+        run: |
+          Remove-Item -Recurse -Path ".\..\\.cargo" -Force -ErrorAction SilentlyContinue
+
+  check-dependencies:
+    name: Check Dependencies & Licenses
+    runs-on: windows-latest
+    needs: [detect_changes, setup-windows-environment]
+    if: needs.detect_changes.outputs.should_run == 'true'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        shell: powershell
+        run: |
+          if (!(Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing Rust..."
+            Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile "rustup-init.exe"
+            .\rustup-init.exe -y --default-toolchain none
+            Remove-Item "rustup-init.exe"
+            $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          }
+          rustup show
+
+      - name: Install cargo-machete
+        shell: powershell
+        run: |
+          cargo install cargo-machete --locked
+
+      - name: Check for unused dependencies
+        shell: powershell
+        run: |
+          Write-Host "Checking for unused dependencies..."
+          cargo machete
+
+      - name: Check licenses (if changed)
+        shell: powershell
+        run: |
+          Write-Host "Checking licenses..."
+          .\script\generate-licenses.ps1
+
+  # Backend dependencies setup for collaborative features (optional)
+  setup-backend:
+    name: Setup Backend Dependencies (Optional)
+    runs-on: windows-latest
+    if: false # Disabled by default - enable manually if needed
+    needs: [detect_changes]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup PostgreSQL with Docker
+        shell: powershell
+        run: |
+          Write-Host "Setting up backend dependencies with Docker Compose..."
+          if (Get-Command docker -ErrorAction SilentlyContinue) {
+            docker compose up -d
+            Write-Host "Backend services started successfully"
+          } else {
+            Write-Host "Docker not available. Skipping backend setup."
+            Write-Host "To setup manually, install PostgreSQL and LiveKit."
+          }
+
+  # Windows installer bundle (only for releases or manual trigger)
+  bundle-windows:
+    name: Create Windows Installer
+    runs-on: windows-latest
+    needs: [detect_changes, build, test]
+    if: |
+      needs.detect_changes.outputs.should_run == 'true' && 
+      (startsWith(github.ref, 'refs/tags/v') || 
+       github.event.inputs.create_bundle == 'true' ||
+       contains(github.event.pull_request.labels.*.name, 'run-bundling'))
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Setup Rust toolchain
+        shell: powershell
+        run: |
+          if (!(Get-Command rustup -ErrorAction SilentlyContinue)) {
+            Write-Host "Installing Rust..."
+            Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile "rustup-init.exe"
+            .\rustup-init.exe -y --default-toolchain none
+            Remove-Item "rustup-init.exe"
+            $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
+          }
+          rustup show
+
+      - name: Determine version and release channel
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: powershell
+        run: |
+          # This sets environment variables for the release
+          .\script\determine-release-channel.ps1
+
+      - name: Set development environment variables
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        shell: powershell
+        run: |
+          # Set default values for development builds
+          $version = Get-Date -Format "yyyy.MM.dd.HHmm"
+          Write-Output "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
+          Write-Output "ZED_RELEASE_CHANNEL=dev" >> $env:GITHUB_ENV
+
+      - name: Set environment variables for bundle script
+        shell: powershell
+        run: |
+          # Set required environment variables for the bundle script
+          $workspace = $pwd.Path
+          Write-Output "ZED_WORKSPACE=$workspace" >> $env:GITHUB_ENV
+          
+          # Note: Signing variables would need to be set in repository secrets/vars for production builds
+          Write-Output "FILE_DIGEST=SHA256" >> $env:GITHUB_ENV
+          Write-Output "TIMESTAMP_DIGEST=SHA256" >> $env:GITHUB_ENV
+          Write-Output "TIMESTAMP_SERVER=http://timestamp.acs.microsoft.com" >> $env:GITHUB_ENV
+
+      - name: Build Windows installer
+        shell: powershell
+        run: |
+          Write-Host "Building Windows installer..."
+          .\script\bundle-windows.ps1
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        with:
+          name: zed-installer-windows-${{ github.sha }}
+          path: target/*.exe
+          retention-days: 7
+
+      - name: Upload installer to release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          draft: true
+          prerelease: ${{ contains(github.ref, 'pre') }}
+          files: target/*.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Summary job
+  windows-build-summary:
+    name: Windows Build Summary
+    runs-on: windows-latest
+    needs: 
+      - detect_changes
+      - setup-windows-environment
+      - build
+      - test
+      - check-dependencies
+    if: always() && needs.detect_changes.outputs.should_run == 'true'
+    steps:
+      - name: Check results
+        shell: powershell
+        run: |
+          $success = $true
+          
+          Write-Host "=== Windows Build Summary ==="
+          
+          # Check each job result
+          $jobs = @{
+            "Environment Setup" = "${{ needs.setup-windows-environment.result }}"
+            "Build" = "${{ needs.build.result }}"
+            "Test" = "${{ needs.test.result }}"
+            "Dependencies Check" = "${{ needs.check-dependencies.result }}"
+          }
+          
+          foreach ($job in $jobs.GetEnumerator()) {
+            $status = $job.Value
+            $name = $job.Key
+            
+            if ($status -eq "success") {
+              Write-Host "✅ $name - Passed"
+            } elseif ($status -eq "failure") {
+              Write-Host "❌ $name - Failed"
+              $success = $false
+            } elseif ($status -eq "cancelled") {
+              Write-Host "⏸️  $name - Cancelled"
+              $success = $false
+            } else {
+              Write-Host "⚠️  $name - $status"
+            }
+          }
+          
+          if ($success) {
+            Write-Host ""
+            Write-Host "🎉 All Windows build jobs completed successfully!"
+            exit 0
+          } else {
+            Write-Host ""
+            Write-Host "❌ Some Windows build jobs failed."
+            exit 1
+          }
